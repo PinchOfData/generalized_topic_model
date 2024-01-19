@@ -3,3 +3,6 @@ venv/*
 ckpt/*
 gtm/__pycache__/*
 .DS_Store
+.idea
+*.pkl
+*.zip
