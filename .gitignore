@@ -1,7 +1,10 @@
-data/*
-venv/*
-ckpt/*
-gtm/__pycache__/*
-.DS_Store
-.idea
+data
+ckpt
+*.zip
+*.ckpt
 *.pkl
+.idea
+.DS_Store
+.gitignore
+*.tff
+__pycache__

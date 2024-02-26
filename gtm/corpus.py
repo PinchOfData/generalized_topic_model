@@ -85,7 +85,7 @@ class GTMCorpus(Dataset):
             self.V_embeddings = np.array([self.Doc2Vec_model.infer_vector([token]) for token in self.vocab])
 
         if embeddings_type == 'SentenceTransformer':
-            self.M_embeddings = bert_embeddings_from_list(df['doc'], sbert_model_to_load, batch_size, max_seq_length)
+            self.M_embeddings = bert_embeddings_from_list(df['doc_clean'], sbert_model_to_load, batch_size, max_seq_length)
             self.V_embeddings = bert_embeddings_from_list(self.vocab, sbert_model_to_load, batch_size, max_seq_length)
 
         # Extract prevalence covariates matrix
@@ -153,5 +153,8 @@ class GTMCorpus(Dataset):
 
         if self.labels is not None:
             d['M_labels'] = self.M_labels[i]
+
+        if self.language is not None:
+            d['language'] = self.language[i]
 
         return d
