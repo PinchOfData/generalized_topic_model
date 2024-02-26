@@ -27,10 +27,17 @@ Paper: Neural Topic Models for the Social Sciences, by Elliott Ash, Germain Gaut
 
 For all tasks, download the following zips and unzip in the project root directory.
 
-checkpoints: [ckpt2.zip](www.google.com)
+checkpoints: [ckpt2.zip]() (Coming soon!)
 
-dataset: [data.zip](www.google.com)
+dataset: [data.zip](https://drive.google.com/file/d/1X0EDDpR3xrSVmrf7M0elvxyl4VR5dMYJ/view?usp=drive_link)
 
+Please also download the pkl files below and put into the **notebooks** folder.
+
+[train_dataset_intfloat-e5-large2-en-zh.pkl](https://drive.google.com/file/d/1Mu_1l4AGScU6oRSZu1i-IU5C5fLDpe8y/view?usp=drive_link)
+
+[train_dataset_intfloat-e5-large2-zh.pkl](https://drive.google.com/file/d/1457gr271TWSHiuWT35YNd5IBJTaCmgUm/view?usp=drive_link)
+
+[train_dataset_intfloat-e5-large2-en.pkl](https://drive.google.com/file/d/1Je1A5cZYI7f4lxuLY-Tci16rAWLvIB1K/view?usp=drive_link)
 
 # Task 1: zero shot, trained on one language and test on another
 
