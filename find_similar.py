@@ -1,5 +1,5 @@
 import torch
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, AutoTokenizer, AutoModel
 from tqdm import tqdm
 import os
 
@@ -47,8 +47,8 @@ def save_similar_examples(examples, top_k_similar, top_k_similar_examples, file_
       file.write('\n')
 
 def main():
-  model = BertModel.from_pretrained('bert-base-multilingual-cased')
-  tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+  model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+  tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
   model.eval()
   # move model to mps
   if torch.backends.mps.is_available():
