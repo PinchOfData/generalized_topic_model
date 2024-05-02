@@ -13,21 +13,11 @@ import spacy
 from spacy.cli import download as spacy_download
 import torch
 from torch.distributions.dirichlet import Dirichlet
-import gensim
-from gensim.corpora.dictionary import Dictionary
-
-def vect2gensim(vectorizer, dtmatrix):
-    corpus_vect_gensim = gensim.matutils.Sparse2Corpus(dtmatrix, documents_columns=False)
-    dictionary = Dictionary.from_corpus(corpus_vect_gensim,
-        id2word=dict((id, word) for word, id in vectorizer.vocabulary_.items()))
-
-    return (corpus_vect_gensim, dictionary)
 
 class text_processor:
     """
     Clean a corpus with SpaCy.
     """
-
     def __init__(
         self,
         spacy_model: str,
@@ -37,8 +27,9 @@ class text_processor:
         lowercase: bool = True,
         lemmatize: bool = True,
         pos_tags_to_keep: Optional[List[str]] = None,
-        remove_chars: Optional[List[str]] = None,
-    ):
+        remove_chars: Optional[List[str]] = None
+        ):
+
         """
         Args:
             spacy_model : string, name of the SpaCy model to use
@@ -50,62 +41,66 @@ class text_processor:
             pos_tags_to_keep : list of strings, list of Part of Speech tags to keep
             remove_chars : list of strings, list of characters to remove
         """
-
+        
         if not spacy.util.is_package(spacy_model):
             spacy_download(spacy_model)
-
+            
         self.spacy_model = spacy_model
-        self._nlp = spacy.load(spacy_model, disable=["ner", "parser"])
-        self._nlp.add_pipe("sentencizer")
+        self._nlp = spacy.load(spacy_model, disable = ['ner', 'parser'])
+        self._nlp.add_pipe('sentencizer')
         self.remove_punctuation = remove_punctuation
         self.remove_digits = remove_digits
         self.stop_words = stop_words
         self.lowercase = lowercase
         self.lemmatize = lemmatize
-        self.pos_tags_to_keep = pos_tags_to_keep
-        self.remove_chars = remove_chars
+        self.pos_tags_to_keep = pos_tags_to_keep    
+        self.remove_chars = remove_chars  
 
-    def clean_text(self, s) -> List[str]:
+    def clean_text(
+        self, 
+        s
+    ) -> List[str]:
+
         """
         Clean a SpaCy doc.
         """
-
+                        
         if self.remove_punctuation:
             s = [t for t in s if t.is_punct == False]
-
+        
         if self.remove_digits:
             s = [t for t in s if t.is_digit == False]
-
+        
         if self.pos_tags_to_keep is not None:
             temp = []
-            for t in s:
+            for t in s: 
                 if t.pos_ in self.pos_tags_to_keep:
                     temp.append(t)
             s = temp
-
+                    
         if self.lowercase and not self.lemmatize:
             s = [t.lower_ for t in s]
-
+            
         if self.lowercase and self.lemmatize:
             s = [t.lemma_.lower() for t in s]
 
         if not self.lowercase and not self.lemmatize:
             s = [t.text for t in s]
-
+        
         if self.remove_chars is not None:
             for char in self.remove_chars:
-                s = [t.replace(char, " ") for t in s]
-
+                s = [t.replace(char, ' ') for t in s]
+        
         s = [t for t in s if t not in self.stop_words]
 
         s = [t.strip() for t in s if t not in self.stop_words]
 
         s = " ".join(s)
-
+                            
         s = s.strip()
-
+            
         return s
-
+       
     def process_docs(
         self,
         docs: List[str],
@@ -113,18 +108,19 @@ class text_processor:
         n_process: int = -1,
         output_path: Optional[str] = None,
         return_docs: bool = False,
-        reload_model_every=10000,  # helps with memory leakage issues
-        progress_bar: bool = True,
+        reload_model_every=10000, # helps with memory leakage issues
+        progress_bar: bool = True
     ):
+        
         """
         SpaCy pipeline with multiprocessing.
         """
-
+        
         spacy_docs = self._nlp.pipe(docs, batch_size=batch_size, n_process=n_process)
-
+        
         if progress_bar:
             spacy_docs = tqdm(spacy_docs, total=len(docs))
-
+        
         counter = 0
 
         if output_path is None:
@@ -134,7 +130,7 @@ class text_processor:
                 docs_clean.append(cleaned_text)
                 counter += 1
                 if counter > reload_model_every:
-                    self._nlp = spacy.load(self.spacy_model, disable=["ner", "parser"])
+                    self._nlp = spacy.load(self.spacy_model, disable = ['ner', 'parser'])
                     counter = 0
         else:
             with open(output_path, "w", newline="") as csvfile:
@@ -146,9 +142,7 @@ class text_processor:
                     writer.writerow([cleaned_text])
                     counter += 1
                     if counter > reload_model_every:
-                        self._nlp = spacy.load(
-                            self.spacy_model, disable=["ner", "parser"]
-                        )
+                        self._nlp = spacy.load(self.spacy_model, disable = ['ner', 'parser'])
                         counter = 0
             if return_docs:
                 docs_clean = pd.read_csv(output_path)["doc_clean"].tolist()
@@ -156,7 +150,6 @@ class text_processor:
                 docs_clean = None
 
         return docs_clean
-
 
 def check_max_local_length(max_seq_length, texts):
     max_local_length = np.max([len(t.split()) for t in texts])
@@ -169,12 +162,15 @@ def check_max_local_length(max_seq_length, texts):
 
 
 def bert_embeddings_from_list(
-    texts, sbert_model_to_load, batch_size, max_seq_length, device="cpu"
+    texts, sbert_model_to_load, batch_size, max_seq_length
 ):
     """
     Creates SBERT Embeddings from a list
     """
-
+    # support macos GPU
+    device = 'cuda' if torch.cuda.is_available() else "cpu"
+    if torch.backends.mps.is_available():
+        device = 'mps'
     model = SentenceTransformer(sbert_model_to_load, device=device)
 
     if max_seq_length is not None:
@@ -185,75 +181,51 @@ def bert_embeddings_from_list(
     return np.array(model.encode(texts, show_progress_bar=True, batch_size=batch_size))
 
 
-def compute_mmd_loss(x, y, device, kernel = 'multiscale'):
-    """Emprical maximum mean discrepancy. The lower the result
-       the more evidence that distributions are the same.
-
-    Args:
-        x: first sample, distribution P
-        y: second sample, distribution Q
-        kernel: kernel type such as "multiscale" or "rbf"
-    """
-    xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
-    rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    ry = (yy.diag().unsqueeze(0).expand_as(yy))
-    
-    dxx = rx.t() + rx - 2. * xx # Used for A in (1)
-    dyy = ry.t() + ry - 2. * yy # Used for B in (1)
-    dxy = rx.t() + ry - 2. * zz # Used for C in (1)
-    
-    XX, YY, XY = (torch.zeros(xx.shape).to(device),
-                  torch.zeros(xx.shape).to(device),
-                  torch.zeros(xx.shape).to(device))
-    
-    if kernel == "multiscale":
-
-        #bandwidth_range = [0.2, 0.5, 0.7, 1, 1.3]
-        bandwidth_range = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]
-        for a in bandwidth_range:
-            XX += a**2 * (a**2 + dxx)**-1
-            YY += a**2 * (a**2 + dyy)**-1
-            XY += a**2 * (a**2 + dxy)**-1
-            
-    if kernel == "rbf":
-
-        bandwidth_range = [10, 15, 20, 50]
-        #bandwidth_range = [10, 15, 20, 50]
-        for a in bandwidth_range:
-            XX += torch.exp(-0.5*dxx/a)
-            YY += torch.exp(-0.5*dyy/a)
-            XY += torch.exp(-0.5*dxy/a)
-
-    return torch.mean(XX + YY - 2. * XY)
-
-
-def compute_mmd_loss(x, y, device, t=0.1, kernel="diffusion"):
-    """
+def compute_mmd_loss(x, y, device, t=0.1, kernel='diffusion'):
+    '''
     Computes the MMD loss with information diffusion kernel.
 
     Reference:
         - https://github.com/zll17/Neural_Topic_Models
-    """
+    '''
     eps = 1e-6
     n, d = x.shape
+    if kernel == 'tv':
+        sum_xx = torch.zeros(1).to(device)
+        for i in range(n):
+            for j in range(i+1, n):
+                sum_xx = sum_xx + torch.norm(x[i]-x[j], p=1).to(device)
+        sum_xx = sum_xx / (n * (n-1))
+
+        sum_yy = torch.zeros(1).to(device)
+        for i in range(y.shape[0]):
+            for j in range(i+1, y.shape[0]):
+                sum_yy = sum_yy + torch.norm(y[i]-y[j], p=1).to(device)
+        sum_yy = sum_yy / (y.shape[0] * (y.shape[0]-1))
+
+        sum_xy = torch.zeros(1).to(device)
+        for i in range(n):
+            for j in range(y.shape[0]):
+                sum_xy = sum_xy + torch.norm(x[i]-y[j], p=1).to(device)
+        sum_yy = sum_yy / (n * y.shape[0])
+    else:
+        qx = torch.sqrt(torch.clamp(x, eps, 1))
+        qy = torch.sqrt(torch.clamp(y, eps, 1))
+        xx = torch.matmul(qx, qx.t())
+        yy = torch.matmul(qy, qy.t())
+        xy = torch.matmul(qx, qy.t())
+
+        def diffusion_kernel(a, tmpt, dim):
+            return torch.exp(-torch.acos(a).pow(2)) / tmpt
+
+        off_diag = 1 - torch.eye(n).to(device)
+        k_xx = diffusion_kernel(torch.clamp(xx, 0, 1-eps), t, d-1)
+        k_yy = diffusion_kernel(torch.clamp(yy, 0, 1-eps), t, d-1)
+        k_xy = diffusion_kernel(torch.clamp(xy, 0, 1-eps), t, d-1)
+        sum_xx = (k_xx * off_diag).sum() / (n * (n-1))
+        sum_yy = (k_yy * off_diag).sum() / (n * (n-1))
+        sum_xy = 2 * k_xy.sum() / (n * n)
     
-    qx = torch.sqrt(torch.clamp(x, eps, 1))
-    qy = torch.sqrt(torch.clamp(y, eps, 1))
-    xx = torch.matmul(qx, qx.t())
-    yy = torch.matmul(qy, qy.t())
-    xy = torch.matmul(qx, qy.t())
-
-    def diffusion_kernel(a, tmpt, dim):
-        return torch.exp(-torch.acos(a).pow(2)) / tmpt
-
-    off_diag = 1 - torch.eye(n).to(device)
-    k_xx = diffusion_kernel(torch.clamp(xx, 0, 1 - eps), t, d - 1)
-    k_yy = diffusion_kernel(torch.clamp(yy, 0, 1 - eps), t, d - 1)
-    k_xy = diffusion_kernel(torch.clamp(xy, 0, 1 - eps), t, d - 1)
-    sum_xx = (k_xx * off_diag).sum() / (n * (n - 1))
-    sum_yy = (k_yy * off_diag).sum() / (n * (n - 1))
-    sum_xy = 2 * k_xy.sum() / (n * n)
-
     mmd_loss = sum_xx + sum_yy - sum_xy
 
     return mmd_loss
@@ -266,28 +238,12 @@ def compute_dirichlet_likelihood(alphas, posterior_theta):
     """
     N = alphas.shape[0]
     n_topics = alphas.shape[1]
-    transformed_thetas = 1 / N * (posterior_theta * (N - 1) + 1 / n_topics)
-    LL = (
-        alphas.sum(1).lgamma()
-        - alphas.lgamma().sum(1)
-        + ((alphas - 1) * torch.log(transformed_thetas)).sum(1)
-    )
+    transformed_thetas = 1/N * (posterior_theta*(N-1) + 1/n_topics)   
+    LL = alphas.sum(1).lgamma() - alphas.lgamma().sum(1) + ((alphas-1)*torch.log(transformed_thetas)).sum(1)
     return LL.sum()
-
 
 def top_k_indices_column(col, k):
     """
     Returns the indices of the top k largest values for each column in a NumPy array.
     """
     return np.argsort(col)[-k:]
-
-
-def topic_diversity(topic_words, topK=10):
-    """
-    Computes the topic diversity of a topic-word matrix (measured as the proportion of unique words in the top-k words of each topic).
-    """
-    unique_words = set()
-    for topic in topic_words:
-        unique_words = unique_words.union(set(topic[:topK]))
-    td = len(unique_words) / (topK * len(topic_words))
-    return td

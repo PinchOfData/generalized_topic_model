@@ -1,30 +1,9 @@
-# The Generalized Topic Model (GTM)
+Torch implementation of the generalized topic model.
 
-The Generalized Topic Model (GTM) is a neural topic model that can be used for exploration, causal inference, and prediction tasks on large text corpora. 
+Implementation using aligned docs from Google Translate.
 
-It can handle all forms of document-level metadata:
+First download dataset from https://drive.google.com/file/d/1X0EDDpR3xrSVmrf7M0elvxyl4VR5dMYJ/view?usp=sharing, then unzip the downloaded data.zip in the root directory of the project.
 
-- **Prevalence covariates** influence topic choice.
-- **Content covariates** influence topic content.
-- **Document labels** are outcomes you want to predict based on document topic shares.
-- **Prediction covariates** influence the prediction of document labels.
+Example Usage:
 
-It supports two types of document representations: 
-- **Document embeddings** (e.g., Doc2Vec, SBERT)
-- **Bag-of-words** (e.g., ngrams, TF-IDF)
-
-## Installation
-
-```pip install generalized_topic_model```
-
-## Tutorials 
-
-Get started with one of our [notebooks](notebooks/).
-
-## References
-
-- The Generalized Topic Model (Elliott Ash, Germain Gauthier, Philine Widmer)
-
-## Note
-
-Remember that this is a research tool :)
+    python gtm_wiki_task8.py --train_bs 512 --epochs 10000 --w_pred_loss 0.0 --w_mmd 1.0 --encoder_input embeddings --decoder_output bow --separate_encoder --separate_decoder --lr 0.001 --model_name intfloat/multilingual-e5-large --encoder_hidden_layers 256 --decoder_hidden_layers 256 --predictor_hidden_layers 128
