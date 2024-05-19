@@ -7,8 +7,8 @@ from patsy import dmatrix
 import numpy as np
 from sklearn.feature_extraction.text import CountVectorizer
 import scipy
-from gensim.models.doc2vec import Doc2Vec, TaggedDocument
-from utils import bert_embeddings_from_list
+# from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+from gtm.utils import bert_embeddings_from_list
 
 
 class GTMCorpus(Dataset):
@@ -32,6 +32,9 @@ class GTMCorpus(Dataset):
         max_seq_length=100000,
         doc2vec_args={},
         device=None,
+        num_en=0,
+        num_zh=0,
+        language='en' # 'en' or 'zh' or 'both'
     ):
         """
         Initialize GTMCorpus.
@@ -68,6 +71,9 @@ class GTMCorpus(Dataset):
         self.doc2vec_args = doc2vec_args
         self.df = df
         self.device = device
+        self.num_en = num_en
+        self.num_zh = num_zh
+        self.language = language
 
         # Compute bag of words matrix
         if vectorizer is None:
@@ -90,25 +96,25 @@ class GTMCorpus(Dataset):
         self.M_embeddings = None
         self.V_embeddings = None
 
-        if embeddings_type == "Doc2Vec":
-            clean_docs = [doc.split() for doc in df["doc_clean"]]
-            tagged_documents = [
-                TaggedDocument(doc, [i]) for i, doc in enumerate(clean_docs)
-            ]
-            self.Doc2Vec_model = Doc2Vec(tagged_documents, **doc2vec_args)
-            self.M_embeddings = np.array(
-                [self.Doc2Vec_model.infer_vector(doc) for doc in clean_docs]
-            )
-            self.V_embeddings = np.array(
-                [self.Doc2Vec_model.infer_vector([token]) for token in self.vocab]
-            )
+        # if embeddings_type == "Doc2Vec":
+        #     clean_docs = [doc.split() for doc in df["doc_clean"]]
+        #     tagged_documents = [
+        #         TaggedDocument(doc, [i]) for i, doc in enumerate(clean_docs)
+        #     ]
+        #     self.Doc2Vec_model = Doc2Vec(tagged_documents, **doc2vec_args)
+        #     self.M_embeddings = np.array(
+        #         [self.Doc2Vec_model.infer_vector(doc) for doc in clean_docs]
+        #     )
+        #     self.V_embeddings = np.array(
+        #         [self.Doc2Vec_model.infer_vector([token]) for token in self.vocab]
+        #     )
 
         if embeddings_type == "SentenceTransformer":
             self.M_embeddings = bert_embeddings_from_list(
-                df["doc"], sbert_model_to_load, batch_size, max_seq_length, device
+                df["doc_clean"], sbert_model_to_load, batch_size, max_seq_length
             )
             self.V_embeddings = bert_embeddings_from_list(
-                self.vocab, sbert_model_to_load, batch_size, max_seq_length, device
+                self.vocab, sbert_model_to_load, batch_size, max_seq_length
             )
 
         # Extract prevalence covariates matrix
@@ -141,6 +147,8 @@ class GTMCorpus(Dataset):
         else:
             self.M_labels = None
 
+        self.post_process()
+
     def _transform_df(self, formula):
         """
         Uses the patsy package to transform covariates into appropriate matrices
@@ -154,7 +162,33 @@ class GTMCorpus(Dataset):
 
     def __len__(self):
         """Return length of dataset."""
-        return len(self.df)
+        if self.language == 'en':
+            return self.num_en
+        elif self.language == 'zh':
+            return self.num_zh
+        else:
+            return self.num_en + self.num_zh
+
+    def post_process(self):
+        '''
+        limit examples to specific language, English always comes the first
+        '''
+        if self.language == 'en':
+            self.M_bow = self.M_bow[:self.num_en] if self.M_bow is not None else None
+            self.M_embeddings = self.M_embeddings[:self.num_en] if self.M_embeddings is not None else None
+            self.M_prevalence_covariates = self.M_prevalence_covariates[:self.num_en] if self.M_prevalence_covariates is not None else None
+            self.M_content_covariates = self.M_content_covariates[:self.num_en] if self.M_content_covariates is not None else None
+            self.M_prediction = self.M_prediction[:self.num_en] if self.M_prediction is not None else None
+            self.M_labels = self.M_labels[:self.num_en] if self.M_labels is not None else None
+        elif self.language == 'zh':
+            self.M_bow = self.M_bow[self.num_en:] if self.M_bow is not None else None
+            self.M_embeddings = self.M_embeddings[self.num_en:] if self.M_embeddings is not None else None
+            self.M_prevalence_covariates = self.M_prevalence_covariates[self.num_en:] if self.M_prevalence_covariates is not None else None
+            self.M_content_covariates = self.M_content_covariates[self.num_en:] if self.M_content_covariates is not None else None
+            self.M_prediction = self.M_prediction[self.num_en:] if self.M_prediction is not None else None
+            self.M_labels = self.M_labels[self.num_en:] if self.M_labels is not None else None
+        else:
+            return
 
     def __getitem__(self, i):
         """Return sample from dataset at index i"""
