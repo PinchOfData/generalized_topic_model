@@ -116,10 +116,9 @@ class LogisticNormalPrior(Prior):
                     self.device
                 )
             means = torch.matmul(M_prevalence_covariates, self.lambda_)       
-            z_true = torch.empty((means.shape[0], self.sigma.shape[0]))
-            for i in range(means.shape[0]):
-                m = MultivariateNormal(means[i], self.sigma)
-                z_true[i] = m.sample()
+            mvn = MultivariateNormal(loc=means, covariance_matrix=self.sigma)
+            z_true = mvn.sample()  # or mvn.rsample()
+
         if to_simplex:
             z_true = torch.softmax(z_true, dim=1)
         return z_true.float()
@@ -129,10 +128,8 @@ class LogisticNormalPrior(Prior):
         Simulate data to test the prior's updating rule.
         """
         means = torch.matmul(M_prevalence_covariates, lambda_)
-        z_sim = torch.empty((means.shape[0], sigma.shape[0]))
-        for i in range(means.shape[0]):
-            m = MultivariateNormal(means[i], sigma)
-            z_sim[i] = m.sample()
+        mvn = MultivariateNormal(loc=means, covariance_matrix=sigma)
+        z_sim = mvn.sample()  
         if to_simplex:
             z_sim = torch.softmax(z_sim, dim=1)
         return z_sim.float()
@@ -153,6 +150,26 @@ class LogisticNormalPrior(Prior):
             .format(precision=2)
         )
         return p
+
+    def get_prior_params(self, M_prevalence_covariates):
+        """
+        Return the mean and log-variance of the metadata-informed prior.
+
+        Returns:
+            mu_p: (N, K) tensor of means
+            logvar_p: (N, K) tensor of log-variances (diagonal of Sigma)
+        """
+        if self.prevalence_covariates_size == 0:
+            # Use zero mean and identity covariance
+            mu_p = torch.zeros((M_prevalence_covariates.shape[0], self.n_topics)).to(self.device)
+            logvar_p = torch.zeros_like(mu_p).to(self.device)
+        else:
+            if not torch.is_tensor(M_prevalence_covariates):
+                M_prevalence_covariates = torch.from_numpy(M_prevalence_covariates).to(self.device)
+            mu_p = torch.matmul(M_prevalence_covariates, self.lambda_)
+            logvar_p = torch.log(torch.diag(self.sigma)).unsqueeze(0).expand_as(mu_p)  # Broadcast
+
+        return mu_p.float(), logvar_p.float()
 
     def to(self, device):
         """

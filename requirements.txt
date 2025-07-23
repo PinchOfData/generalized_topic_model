@@ -1,9 +1,6 @@
-torch
-gensim
 numpy
 matplotlib
 scikit-learn
-spacy
 pandas
 sentence-transformers
 patsy
@@ -12,5 +9,5 @@ wordcloud
 statsmodels
 notebook
 umap-learn
-pyLDAvis
 plotly
+spacy

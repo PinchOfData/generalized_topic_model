@@ -8,6 +8,7 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from tqdm import tqdm
@@ -17,7 +18,7 @@ from wordcloud import WordCloud
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from umap import UMAP
-from autoencoders import AutoEncoderMLP
+from autoencoders import EncoderMLP, DecoderMLP, MultiModalEncoderMoE
 from predictors import Predictor
 from priors import DirichletPrior, LogisticNormalPrior
 from utils import compute_mmd_loss, top_k_indices_column
@@ -27,29 +28,34 @@ import numpy as np
 import torch.multiprocessing as mp
 from typing import Optional, List, Dict, Union
 from corpus import GTMCorpus
+from collections import OrderedDict
+import statsmodels.api as sm
+
+def parse_modality_view(key: str):
+    if '_' not in key:
+        raise ValueError(f"Expected 'modality.view', got '{key}'")
+    return key.split('_', 1)
 
 class GTM:
-    """
-    Wrapper class for the Generalized Topic Model.
-    """
-
     def __init__(
         self,
         train_data: Optional[GTMCorpus] = None,
         test_data: Optional[GTMCorpus] = None,
         n_topics: int = 20,
+        ae_type: str = "wae",
         doc_topic_prior: str = "dirichlet",
         update_prior: bool = False,
         alpha: float = 0.1,
         prevalence_model_type: str = "RidgeCV",
         prevalence_model_args: Dict = {},
         tol: float = 0.001,
-        encoder_input: str = "bow",
-        encoder_hidden_layers: List[int] = [512],
+        encoder_input: Union[str, List[str]] = "default_bow",
+        decoder_input: Union[str, List[str]] = "default_bow",
+        encoder_hidden_layers: List[int] = [256],
         encoder_non_linear_activation: str = "relu",
         encoder_bias: bool = True,
-        encoder_include_prevalence_covariates: bool = True,
-        decoder_hidden_layers: List[int] = [300],
+        encoder_gating: bool = False,
+        decoder_hidden_layers: List[int] = [],
         decoder_non_linear_activation: Optional[str] = None,
         decoder_bias: bool = False,
         predictor_type: Optional[str] = None,
@@ -72,16 +78,20 @@ class GTM:
         delta: float = 0.0,
         w_prior: Union[int, None] = 1,
         w_pred_loss: int = 1,
+        kl_annealing_start: int = 0,
+        kl_annealing_end: int = 100,
+        kl_annealing_max_beta: float = 1.0,
         ckpt_folder: str = "../ckpt",
         ckpt: Optional[str] = None,
         device: Optional[torch.device] = None,
         seed: Optional[int] = 42,
-    ) -> None:
+    ):
         """
         Args:
             train_data: a GTMCorpus object
             test_data: a GTMCorpus object
             n_topics: number of topics
+            ae_type: type of autoencoder. Either 'wae' (Wasserstein Autoencoder) or 'vae' (Variational Autoencoder).
             doc_topic_prior: prior on the document-topic distribution. Either 'dirichlet' or 'logistic_normal'.
             update_prior: whether to update the prior at each epoch to account for prevalence covariates.
             alpha: parameter of the Dirichlet prior (only used if update_prior=False)
@@ -113,177 +123,190 @@ class GTM:
             delta: threshold to stop the training if the validation or training loss does not improve.
             w_prior: parameter to control the tightness of the encoder output with the document-topic prior. If set to None, w_prior is chosen automatically.
             w_pred_loss: parameter to control the weight given to the prediction task in the likelihood. Default is 1.
+            kl_annealing_start: epoch at which to start the KL annealing.
+            kl_annealing_end: epoch at which to end the KL annealing.
+            kl_annealing_max_beta: maximum value of the KL annealing beta.
             ckpt_folder: folder to save the checkpoints.
             ckpt: checkpoint to load the model from.
             device: device to use for training.
             seed: random seed.
+        """        
 
-        References:
-            - Nan, F., Ding, R., Nallapati, R., & Xiang, B. (2019). Topic modeling with wasserstein autoencoders. arXiv preprint arXiv:1907.12374.
-        """
+        if isinstance(encoder_input, str):
+            encoder_input = [encoder_input]
+        if isinstance(decoder_input, str):
+            decoder_input = [decoder_input]
 
         if ckpt:
             self.load_model(ckpt)
+            return
+
+        self.n_topics = n_topics
+        self.ae_type = ae_type
+        self.topic_labels = [f"Topic_{i}" for i in range(n_topics)]
+        self.doc_topic_prior = doc_topic_prior
+        self.update_prior = update_prior
+        self.alpha = alpha
+        self.prevalence_model_type = prevalence_model_type
+        self.prevalence_model_args = prevalence_model_args
+        self.tol = tol
+        self.encoder_input = encoder_input
+        self.decoder_input = decoder_input
+
+        self.encoder_hidden_layers = encoder_hidden_layers
+        self.encoder_non_linear_activation = encoder_non_linear_activation
+        self.encoder_bias = encoder_bias
+        self.encoder_gating = encoder_gating
+        self.decoder_hidden_layers = decoder_hidden_layers
+        self.decoder_non_linear_activation = decoder_non_linear_activation
+        self.decoder_bias = decoder_bias
+        self.predictor_type = predictor_type
+        self.predictor_hidden_layers = predictor_hidden_layers
+        self.predictor_non_linear_activation = predictor_non_linear_activation
+        self.predictor_bias = predictor_bias
+
+        self.initialization = initialization
+        self.device = device or (
+            torch.device("cuda") if torch.cuda.is_available() else
+            torch.device("mps") if torch.backends.mps.is_available() else
+            torch.device("cpu")
+        )
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.num_workers = num_workers if num_workers is not None else mp.cpu_count()
+        self.dropout = dropout
+        self.regularization = regularization
+
+        self.print_every_n_epochs = print_every_n_epochs
+        self.print_every_n_batches = print_every_n_batches
+        self.print_topics = print_topics
+        self.print_content_covariates = print_content_covariates
+        self.log_every_n_epochs = log_every_n_epochs
+        self.patience = patience
+        self.delta = delta
+        self.w_prior = w_prior
+        self.kl_annealing_start = kl_annealing_start
+        self.kl_annealing_end = kl_annealing_end
+        self.kl_annealing_max_beta = kl_annealing_max_beta
+        self.w_pred_loss = w_pred_loss
+        self.ckpt_folder = ckpt_folder
+
+        if self.ae_type == "vae" and self.doc_topic_prior == "dirichlet":
+            raise ValueError("VAE cannot be used with a Dirichlet prior. Use 'logistic_normal' instead.")
+
+        if not os.path.exists(ckpt_folder):
+            os.makedirs(ckpt_folder)
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.backends.cudnn.deterministic = True
+            np.random.seed(seed)
+
+        self.prevalence_covariate_size = (
+            train_data.M_prevalence_covariates.shape[1] if train_data.prevalence else 0
+        )
+        self.content_covariate_size = (
+            train_data.M_content_covariates.shape[1] if train_data.content else 0
+        )
+        self.prediction_covariate_size = (
+            train_data.M_prediction.shape[1] if train_data.prediction else 0
+        )
+        self.labels_size = (
+            train_data.M_labels.shape[1] if train_data.labels else 0
+        )
+
+        self.content_colnames = train_data.content_colnames or []
+        self.id2token = train_data.id2token
+
+        # Predictor output size
+        if predictor_type == "classifier" and train_data.labels is not None:
+            n_labels = len(np.unique(train_data.M_labels))
         else:
-            self.n_topics = n_topics
-            self.topic_labels = [f"Topic_{i}" for i in range(n_topics)]
-            self.doc_topic_prior = doc_topic_prior
+            n_labels = 1
 
-            self.update_prior = update_prior
-            self.alpha = alpha
-            self.prevalence_model_type = prevalence_model_type
-            self.prevalence_model_args = prevalence_model_args
-            self.tol = tol
-            self.encoder_input = encoder_input
-
-            self.encoder_hidden_layers = encoder_hidden_layers
-            self.encoder_non_linear_activation = encoder_non_linear_activation
-
-            self.encoder_bias = encoder_bias
-            self.encoder_include_prevalence_covariates = encoder_include_prevalence_covariates
-            self.decoder_hidden_layers = decoder_hidden_layers
-            self.decoder_non_linear_activation = decoder_non_linear_activation
-
-            self.decoder_bias = decoder_bias
-            self.predictor_type = predictor_type
-            self.predictor_hidden_layers = predictor_hidden_layers
-            self.predictor_non_linear_activation = predictor_non_linear_activation
-            self.predictor_bias = predictor_bias
-
-            self.initialization = initialization
-            self.device = device
-            self.batch_size = batch_size
-            self.learning_rate = learning_rate
-            self.num_epochs = num_epochs
-            self.num_workers = num_workers if num_workers is not None else mp.cpu_count()
-            self.dropout = dropout
-            self.regularization = regularization
-
-            self.print_every_n_epochs = print_every_n_epochs
-            self.print_every_n_batches = print_every_n_batches
-            self.print_topics = print_topics
-            self.print_content_covariates = print_content_covariates
-            self.log_every_n_epochs = log_every_n_epochs
-            self.patience = patience
-            self.delta = delta
-            self.w_prior = w_prior
-            self.w_pred_loss = w_pred_loss
-            self.ckpt_folder = ckpt_folder
-
-            if not os.path.exists(ckpt_folder):
-                os.makedirs(ckpt_folder)
-
-            self.seed = seed
-            if seed is not None:
-                torch.manual_seed(seed)
-                torch.backends.cudnn.deterministic = True
-                np.random.seed(seed)
-
-            if device is None:
-                if torch.cuda.is_available():
-                    self.device = torch.device("cuda")
-                elif torch.backends.mps.is_available():
-                    self.device = torch.device("mps")
-                else:
-                    self.device = torch.device("cpu")
-
-            bow_size = train_data.M_bow.shape[1]
-            self.bow_size = bow_size
-
-            prevalence_covariate_size = train_data.M_prevalence_covariates.shape[1] if train_data.prevalence is not None else 0
-            content_covariate_size = train_data.M_content_covariates.shape[1] if train_data.content is not None else 0
-            prediction_covariate_size = train_data.M_prediction.shape[1] if train_data.prediction is not None else 0
-            labels_size = train_data.M_labels.shape[1] if train_data.labels is not None else 0
-
-            if train_data.content_colnames is not None:
-                self.content_colnames = train_data.content_colnames
-            else:
-                self.content_colnames = []
-
-            if predictor_type == "classifier" and train_data.labels is not None:
-                n_labels = len(np.unique(train_data.M_labels))
-            else:
-                n_labels = 1
-
-            if encoder_input == "bow":
-                self.input_size = bow_size
-            elif encoder_input == "embeddings":
-                input_embeddings_size = train_data.M_embeddings.shape[1]
-                self.input_size = input_embeddings_size
-
-            self.content_covariate_size = content_covariate_size
-            self.prevalence_covariate_size = prevalence_covariate_size
-            self.labels_size = labels_size
-            self.id2token = train_data.id2token
-
-            encoder_dims = [self.input_size + prevalence_covariate_size] if self.encoder_include_prevalence_covariates else [self.input_size]
-            encoder_dims.extend(encoder_hidden_layers)
-            encoder_dims.append(n_topics)
-
-            decoder_dims = [n_topics + content_covariate_size]
-            decoder_dims.extend(decoder_hidden_layers)
-            decoder_dims.append(bow_size)
-
-            self.AutoEncoder = AutoEncoderMLP(
-                encoder_dims=encoder_dims,
+        # ENCODER
+        encoders = OrderedDict()
+        for key in encoder_input:
+            modality, view = parse_modality_view(key)
+            input_dim = train_data.processed_modalities[modality][view]["matrix"].shape[1]
+            enc_dims = [input_dim + self.prevalence_covariate_size] 
+            enc_dims += encoder_hidden_layers 
+            enc_dims += [n_topics * 2 if ae_type == "vae" else n_topics]
+            encoders[key] = EncoderMLP(
+                encoder_dims=enc_dims,
                 encoder_non_linear_activation=encoder_non_linear_activation,
                 encoder_bias=encoder_bias,
-                decoder_dims=decoder_dims,
+                dropout=dropout,
+            )
+        self.encoder = MultiModalEncoderMoE(
+            encoders=encoders,
+            topic_dim=n_topics,
+            gating=self.encoder_gating,
+            ae_type=self.ae_type,
+        ).to(self.device)
+
+        # DECODERS
+        self.decoders = nn.ModuleDict()
+        for key in decoder_input:
+            modality, view = parse_modality_view(key)
+            output_dim = train_data.processed_modalities[modality][view]["matrix"].shape[1]
+            dec_dims = [n_topics + self.content_covariate_size] + decoder_hidden_layers + [output_dim]
+            self.decoders[key] = DecoderMLP(
+                decoder_dims=dec_dims,
                 decoder_non_linear_activation=decoder_non_linear_activation,
                 decoder_bias=decoder_bias,
                 dropout=dropout,
             ).to(self.device)
 
-            if doc_topic_prior == "dirichlet":
-                self.prior = DirichletPrior(
-                    self.update_prior,
-                    self.prevalence_covariate_size,
-                    self.n_topics,
-                    self.alpha,
-                    self.prevalence_model_args,
-                    self.tol,
-                    device=self.device,
-                )
-            elif doc_topic_prior == "logistic_normal":
-                self.prior = LogisticNormalPrior(
-                    prevalence_covariate_size,
-                    n_topics,
-                    prevalence_model_type,
-                    prevalence_model_args,
-                    device=self.device,
-                )
+        # PRIOR
+        if doc_topic_prior == "dirichlet":
+            self.prior = DirichletPrior(
+                update_prior,
+                self.prevalence_covariate_size,
+                self.n_topics,
+                alpha,
+                prevalence_model_args,
+                tol,
+                device=self.device,
+            )
+        elif doc_topic_prior == "logistic_normal":
+            self.prior = LogisticNormalPrior(
+                self.prevalence_covariate_size,
+                n_topics,
+                prevalence_model_type,
+                prevalence_model_args,
+                device=self.device,
+            )
 
-            if labels_size != 0:
-                predictor_dims = [n_topics + prediction_covariate_size]
-                predictor_dims.extend(predictor_hidden_layers)
-                predictor_dims.append(n_labels)
-                self.predictor = Predictor(
-                    predictor_dims=predictor_dims,
-                    predictor_non_linear_activation=predictor_non_linear_activation,
-                    predictor_bias=predictor_bias,
-                    dropout=dropout,
-                ).to(self.device)
+        # PREDICTOR
+        if self.labels_size != 0:
+            predictor_dims = [n_topics + self.prediction_covariate_size] + predictor_hidden_layers + [n_labels]
+            self.predictor = Predictor(
+                predictor_dims=predictor_dims,
+                predictor_non_linear_activation=predictor_non_linear_activation,
+                predictor_bias=predictor_bias,
+                dropout=dropout,
+            ).to(self.device)
 
-            if self.labels_size != 0:
-                self.optimizer = torch.optim.Adam(
-                    list(self.AutoEncoder.parameters()) + list(self.predictor.parameters()),
-                    lr=self.learning_rate, betas=(0.99, 0.999)#, weight_decay=0.1
-                )
-            else:
-                self.optimizer = torch.optim.Adam(
-                    self.AutoEncoder.parameters(), lr=self.learning_rate, betas=(0.9, 0.999)#, weight_decay=0.1
-                )
+        # OPTIMIZER
+        all_params = list(self.encoder.parameters()) + list(self.decoders.parameters())
+        if self.labels_size != 0:
+            all_params += list(self.predictor.parameters())
+        self.optimizer = torch.optim.Adam(
+            all_params, lr=learning_rate, betas=(0.99, 0.999)
+        )
 
-            self.epochs = 0
-            self.loss = np.Inf
-            self.reconstruction_loss = np.Inf
-            self.mmd_loss = np.Inf
-            self.prediction_loss = np.Inf
+        self.epochs = 0
+        self.loss = np.inf
+        self.reconstruction_loss = np.inf
+        self.mmd_loss = np.inf
+        self.prediction_loss = np.inf
 
-            if self.initialization and self.update_prior:
-                self.initialize(train_data, test_data)
+        if self.initialization and self.update_prior:
+            self.initialize(train_data, test_data)
 
-            self.train(train_data, test_data)
+        self.train(train_data, test_data)
 
     def initialize(self, train_data, test_data=None):
         """
@@ -306,9 +329,11 @@ class GTM:
                 num_workers=self.num_workers,
             )
 
-        best_loss = np.Inf
+        best_loss = np.inf
         counter = 0
         best_model_path = f"{self.ckpt_folder}/best_initial_model.ckpt"
+
+        print('Initializing model...')
 
         for epoch in range(self.num_epochs):
             training_loss = self.epoch(train_data_loader, validation=False, initialization=True)
@@ -374,14 +399,14 @@ class GTM:
         self.save_model("{}/best_model.ckpt".format(self.ckpt_folder))
 
         if self.epochs == 0:
-            best_loss = np.Inf
+            best_loss = np.inf
             best_epoch = -1
 
         else:
             best_loss = self.loss
             best_epoch = self.epochs
 
-        for epoch in range(self.epochs+1, self.num_epochs):
+        for epoch in range(self.epochs, self.num_epochs):
 
             training_loss = self.epoch(train_data_loader, validation=False)
 
@@ -418,8 +443,6 @@ class GTM:
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = current_lr*0.1
                     current_lr = param_group['lr']
-                
-                #print(current_lr)
 
                 if current_lr < 1e-3:
                     print(
@@ -433,66 +456,84 @@ class GTM:
 
             self.epochs += 1
 
-
     def epoch(self, data_loader, validation=False, initialization=False, num_samples=1):
         """
         Train the model for one epoch.
         """
         if validation:
-            self.AutoEncoder.eval()
+            self.encoder.eval()
+            self.decoders.eval()
             if self.labels_size != 0:
                 self.predictor.eval()
         else:
-            self.AutoEncoder.train()
+            self.encoder.train()
+            self.decoders.train()
             if self.labels_size != 0:
                 self.predictor.train()
 
         epochloss_lst = []
         all_topics = []
         all_prevalence_covariates = []
+
         with torch.no_grad() if validation else torch.enable_grad():
             for iter, data in enumerate(data_loader):
                 if not validation:
                     self.optimizer.zero_grad()
 
-                # Unpack data
+                # Move all tensors to device
                 for key, value in data.items():
-                    data[key] = value.to(self.device)
-                bows = data.get("M_bow", None)
-                bows = bows.reshape(bows.shape[0], -1)
-                embeddings = data.get("M_embeddings", None)
+                    if isinstance(value, torch.Tensor):
+                        data[key] = value.to(self.device)
+
                 prevalence_covariates = data.get("M_prevalence_covariates", None)
                 content_covariates = data.get("M_content_covariates", None)
                 prediction_covariates = data.get("M_prediction", None)
                 target_labels = data.get("M_labels", None)
-                if self.encoder_input == "bow":
-                    x_input = bows
-                elif self.encoder_input == "embeddings":
-                    x_input = embeddings
-                x_bows = bows
 
-                # Get theta and compute reconstruction loss
-                if self.encoder_include_prevalence_covariates:
-                    x_recon, theta_q, z = self.AutoEncoder(
-                        x_input, 
-                        prevalence_covariates, 
-                        content_covariates,
-                    )
-                else:
-                    prevalence_covariates_bis = None
-                    x_recon, theta_q, z = self.AutoEncoder(
-                        x_input,
-                        prevalence_covariates_bis,
-                        content_covariates,
-                    )
+                # -------------------- ENCODER INPUT --------------------
+                modality_inputs = {}
+                for key in self.encoder_input:
+                    mod, view = parse_modality_view(key)
+                    x = data["modalities"][mod][view].to(self.device)
 
-                reconstruction_loss = F.cross_entropy(x_recon, x_bows)
-                
-                # Compute MMD Loss with multiple samples
+                    if prevalence_covariates is not None:
+                        x = torch.cat([x, prevalence_covariates], dim=1)
+
+                    modality_inputs[key] = x
+
+                theta_q, z, mu_logvar = self.encoder(modality_inputs)
+                #if self.ae_type == "vae" and not validation:
+                #    with torch.no_grad():
+                #       mus = torch.cat([mu for (mu, _) in mu_logvar], dim=0)
+                #       print("Mean μ:", mus.mean().item(), "Std μ:", mus.std().item())
+
+                # -------------------- DECODERS --------------------
+                reconstruction_loss = 0.0
+                for key, decoder in self.decoders.items():
+                    mod, view = parse_modality_view(key)
+                    target = data["modalities"][mod][view].to(self.device)
+                    theta_input = torch.cat([theta_q, content_covariates], dim=1) if content_covariates is not None else theta_q
+                    recon = decoder(theta_input)
+
+                    view_type = data_loader.dataset.processed_modalities[mod][view]["type"]
+
+                    if view_type == "bow":
+                        log_probs = F.log_softmax(recon, dim=1)
+                        recon_loss = -torch.sum(target * log_probs) / torch.sum(target)
+
+                    elif view_type == "embedding":
+                        recon_loss = F.mse_loss(recon, target)
+
+                    else:
+                        raise ValueError(f"Unsupported view type '{view_type}' for '{mod}_{view}'")
+
+                    reconstruction_loss += recon_loss
+
+                # -------------------- PRIOR / MMD --------------------
                 mmd_loss = 0.0
                 for _ in range(num_samples):
                     theta_prior = self.prior.sample(
-                        N=x_input.shape[0],
+                        N=theta_q.shape[0],
                         M_prevalence_covariates=prevalence_covariates,
                         epoch=self.epochs,
                         initialization=initialization
@@ -500,13 +541,43 @@ class GTM:
                     mmd_loss += compute_mmd_loss(theta_q, theta_prior, device=self.device)
 
                 if self.w_prior is None:
-                    mean_length = torch.sum(x_bows) / x_bows.shape[0]
-                    vocab_size = x_bows.shape[1]
+                    total_tokens = sum(data["modalities"][mod][view].sum() for mod, view in [parse_modality_view(k)] for k in self.decoder_input)
+                    mean_length = total_tokens / theta_q.shape[0]
+                    vocab_size = list(data["modalities"][mod][view].shape[1] for mod, view in [parse_modality_view(k)] for k in self.decoder_input)[0]
                     w_prior = mean_length * np.log(vocab_size)
                 else:
-                    w_prior = self.w_prior #* self.epochs + 1
+                    w_prior = self.w_prior
 
-                # Predict labels and compute prediction loss
+                if self.epochs < self.kl_annealing_start:
+                    beta = 0.0
+                elif self.epochs > self.kl_annealing_end:
+                    beta = self.kl_annealing_max_beta
+                else:
+                    progress = (self.epochs - self.kl_annealing_start) / (self.kl_annealing_end - self.kl_annealing_start)
+                    beta = progress * self.kl_annealing_max_beta
+
+                if self.ae_type == "vae" and self.update_prior:
+                    kl_loss = 0.0
+                    for (mu_q, logvar_q) in mu_logvar:
+                        mu_p, logvar_p = self.prior.get_prior_params(prevalence_covariates)
+                        
+                        # Diagonal KL
+                        kl = 0.5 * torch.sum(
+                            logvar_p - logvar_q + 
+                            (logvar_q.exp() + (mu_q - mu_p).pow(2)) / logvar_p.exp() - 1,
+                            dim=1
+                        ).mean()
+                        kl_loss += kl
+                    divergence_loss = beta*kl_loss
+                elif self.ae_type == "vae" and not self.update_prior:
+                    kl_loss = 0.0
+                    for mu, logvar in mu_logvar:
+                        kl_loss += -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+                    divergence_loss = beta*kl_loss
+                else:
+                    divergence_loss = mmd_loss*w_prior
+
+                # -------------------- PREDICTION --------------------
                 if target_labels is not None:
                     predictions = self.predictor(theta_q, prediction_covariates)
                     if self.predictor_type == "classifier":
@@ -515,17 +586,17 @@ class GTM:
                     elif self.predictor_type == "regressor":
                         prediction_loss = F.mse_loss(predictions, target_labels)
                 else:
-                    prediction_loss = 0
+                    prediction_loss = 0.0
 
-                # L2 Normalization for encoders/decoders
-                l2_norm = 0
-                for param in self.AutoEncoder.parameters():
-                    l2_norm += torch.norm(param, p=2)
+                # -------------------- L2 Regularization --------------------
+                l2_norm = sum(torch.norm(param, p=2) for param in self.encoder.parameters())
+                for decoder in self.decoders.values():
+                    l2_norm += sum(torch.norm(param, p=2) for param in decoder.parameters())
 
-                # Total loss
+                # -------------------- TOTAL LOSS --------------------
                 loss = (
                     reconstruction_loss
-                    + mmd_loss * w_prior
+                    + divergence_loss
                     + prediction_loss * self.w_pred_loss
                     + self.regularization * l2_norm
                 )
@@ -537,91 +608,76 @@ class GTM:
 
                 if not validation:
                     loss.backward()
-                    self.optimizer.step()      
+                    self.optimizer.step()
 
                 epochloss_lst.append(loss.item())
-                if self.update_prior is True and initialization is False and validation is False:
+
+                if self.update_prior and not validation and not initialization:
                     if self.doc_topic_prior == "logistic_normal":
                         all_topics.append(z.detach().cpu())
-                    elif self.doc_topic_prior == "dirichlet":
+                    else:
                         all_topics.append(theta_q.detach().cpu())
                     all_prevalence_covariates.append(prevalence_covariates.detach().cpu())
 
                 if (iter + 1) % self.print_every_n_batches == 0:
-                    if validation:
-                        print(
-                            f"Epoch {(self.epochs+1):>3d}\tIter {(iter+1):>4d}\tMean Validation Loss:{loss.item():<.7f}\nMean Rec Loss:{reconstruction_loss.item():<.7f}\nMMD Loss:{mmd_loss.item()*w_prior:<.7f}\nMean Pred Loss:{prediction_loss*self.w_pred_loss:<.7f}\n"
-                        )
-                    else:
-                        print(
-                            f"Epoch {(self.epochs+1):>3d}\tIter {(iter+1):>4d}\tMean Training Loss:{loss.item():<.7f}\nMean Rec Loss:{reconstruction_loss.item():<.7f}\nMMD Loss:{mmd_loss.item()*w_prior:<.7f}\nMean Pred Loss:{prediction_loss*self.w_pred_loss:<.7f}\n"
-                        )
+                    msg = (
+                        f"Epoch {(self.epochs+1):>3d}\tIter {(iter+1):>4d}"
+                        f"\tMean {'Validation' if validation else 'Training'} Loss:{loss.item():<.7f}"
+                        f"\nRec Loss:{reconstruction_loss.item():<.7f}"
+                        f"\nDivergence Loss:{divergence_loss.item():<.7f}"
+                        f"\nPred Loss:{prediction_loss * self.w_pred_loss:<.7f}\n"
+                    )
+                    print(msg)
 
-        if (self.epochs + 1) % self.print_every_n_epochs == 0:
-            if validation:
-                print(
-                    f"\nEpoch {(self.epochs+1):>3d}\tMean Validation Loss:{sum(epochloss_lst)/len(epochloss_lst):<.7f}\n"
-                )
-            else:
-                print(
-                    f"\nEpoch {(self.epochs+1):>3d}\tMean Training Loss:{sum(epochloss_lst)/len(epochloss_lst):<.7f}\n"
-                )
+        # -------------------- END OF EPOCH --------------------
+        if (self.epochs + 1) % self.print_every_n_epochs == 0 and initialization == False:
+            avg_loss = sum(epochloss_lst) / len(epochloss_lst)
+            print(
+                f"\nEpoch {(self.epochs+1):>3d}\tMean {'Validation' if validation else 'Training'} Loss:{avg_loss:<.7f}\n"
+            )
 
             if self.print_topics:
-                print(
-                    "\n".join(
-                        [
-                            "{}: {}".format(k, str(v))
-                            for k, v in self.get_topic_words().items()
-                        ]
-                    )
-                )
-                print("\n")
+                print("\n".join(
+                    f"{k}: {v}" for k, v in self.get_topic_words().items()
+                ), "\n")
 
             if self.content_covariate_size != 0 and self.print_content_covariates:
-                print(
-                    "\n".join(
-                        [
-                            "{}: {}".format(k, str(v))
-                            for k, v in self.get_covariate_words().items()
-                        ]
-                    )
-                )
-                print("\n")
+                print("\n".join(
+                    f"{k}: {v}" for k, v in self.get_covariate_words().items()
+                ), "\n")
 
-        if self.update_prior is True and initialization is False and validation is False:
+        if self.update_prior and not validation and not initialization:
             all_topics = torch.cat(all_topics, dim=0).numpy()
             all_prevalence_covariates = torch.cat(all_prevalence_covariates, dim=0).numpy()
-            if self.doc_topic_prior == "dirichlet":
-                self.prior.update_parameters(
-                    all_topics, all_prevalence_covariates
-                )
-            else:
-                self.prior.update_parameters(
-                    all_topics, all_prevalence_covariates
-                )             
-            
-            #print(self.prior.lambda_)
+            self.prior.update_parameters(all_topics, all_prevalence_covariates)
 
         return sum(epochloss_lst)
 
     def get_doc_topic_distribution(
-        self, dataset, to_simplex=True, num_workers=None, to_numpy=True
+        self,
+        dataset,
+        to_simplex: bool = True,
+        num_workers: Optional[int] = None,
+        to_numpy: bool = True,
+        single_modality: Optional[str] = None,
+        num_samples: int = 1,
     ):
         """
         Get the topic distribution of each document in the corpus.
 
         Args:
             dataset: a GTMCorpus object
-            to_simplex: whether to map the topic distribution to the simplex. If False, the topic distribution is returned in the logit space.
+            to_simplex: whether to map the topic distribution to the simplex. If False, returns latent logits.
             num_workers: number of workers for the data loaders.
-            to_numpy: whether to return the topic distribution as a numpy array.
+            to_numpy: whether to return as a numpy array.
+            single_modality: if set, uses only this modality (e.g., "default_bow")
+            num_samples: number of samples from the VAE encoder (only used for VAE).
         """
-
-        if num_workers is None: 
+        if num_workers is None:
             num_workers = self.num_workers
 
-        self.AutoEncoder.eval()
+        self.encoder.eval()
+        final_thetas = []
 
         with torch.no_grad():
             data_loader = DataLoader(
@@ -630,45 +686,68 @@ class GTM:
                 shuffle=False,
                 num_workers=num_workers,
             )
-            final_thetas = []
+
             for data in data_loader:
                 for key, value in data.items():
-                    data[key] = value.to(self.device)
-                bows = data.get("M_bow", None)
-                bows = bows.reshape(bows.shape[0], -1)
-                embeddings = data.get("M_embeddings", None)
+                    if isinstance(value, torch.Tensor):
+                        data[key] = value.to(self.device)
+
                 prevalence_covariates = data.get("M_prevalence_covariates", None)
-                content_covariates = data.get("M_content_covariates", None)
-                if self.encoder_input == "bow":
-                    x_input = bows
-                elif self.encoder_input == "embeddings":
-                    x_input = embeddings
-                if self.encoder_include_prevalence_covariates:
-                    _, thetas, z = self.AutoEncoder(
-                        x_input,
-                        prevalence_covariates,
-                        content_covariates
-                    )
+
+                if single_modality is not None:
+                    # Single modality path
+                    mod, view = parse_modality_view(single_modality)
+                    x = data["modalities"][mod][view].to(self.device)
+                    if prevalence_covariates is not None:
+                        x = torch.cat([x, prevalence_covariates], dim=1)
+
+                    z = self.encoder.encoders[single_modality](x)
+
+                    if self.ae_type == "vae":
+                        mu, logvar = torch.chunk(z, 2, dim=1)
+                        thetas = []
+                        for _ in range(num_samples):
+                            std = torch.exp(0.5 * logvar)
+                            eps = torch.randn_like(std)
+                            z_sampled = mu + eps * std
+                            theta = F.softmax(z_sampled, dim=1) if to_simplex else z_sampled
+                            thetas.append(theta)
+                        theta_q = torch.stack(thetas, dim=1).mean(dim=1)
+                    else:
+                        theta_q = F.softmax(z, dim=1) if to_simplex else z
+
                 else:
-                    prevalence_covariates_bis = None
-                    _, thetas, z = self.AutoEncoder(
-                        x_input,
-                        prevalence_covariates_bis,
-                        content_covariates
-                    )
-                if to_simplex:
-                    final_thetas.append(thetas)
-                else:
-                    final_thetas.append(z)
+                    # Multimodal path
+                    modality_inputs = {}
+                    for key in self.encoder_input:
+                        mod, view = parse_modality_view(key)
+                        x = data["modalities"][mod][view].to(self.device)
+                        if prevalence_covariates is not None:
+                            x = torch.cat([x, prevalence_covariates], dim=1)
+                        modality_inputs[key] = x
+
+                    if self.ae_type == "vae":
+                        thetas = []
+                        for _ in range(num_samples):
+                            theta_q, z, _ = self.encoder(modality_inputs)
+                            theta_q = theta_q if to_simplex else z
+                            thetas.append(theta_q)
+                        theta_q = torch.stack(thetas, dim=1).mean(dim=1)
+                    else:
+                        theta_q, z, _ = self.encoder(modality_inputs)
+                        theta_q = theta_q if to_simplex else z
+
+                final_thetas.append(theta_q)
+
             if to_numpy:
-                final_thetas = [tensor.cpu().numpy() for tensor in final_thetas]
+                final_thetas = [t.cpu().numpy() for t in final_thetas]
                 final_thetas = np.concatenate(final_thetas, axis=0)
             else:
                 final_thetas = torch.cat(final_thetas, dim=0)
 
         return final_thetas
 
-    def get_predictions(self, dataset, to_simplex=True, num_workers=None, to_numpy=True):
+    def get_predictions(self, dataset, to_simplex=True, num_workers=None, to_numpy=True, num_samples: int = 1):
         """
         Predict the labels of the documents in the corpus based on topic proportions.
 
@@ -677,12 +756,12 @@ class GTM:
             to_simplex: whether to map the topic distribution to the simplex. If False, the topic distribution is returned in the logit space.
             num_workers: number of workers for the data loaders.
             to_numpy: whether to return the predictions as a numpy array.
+            num_samples: number of samples for VAE (only used if ae_type == 'vae').
         """
-
-        if num_workers is None: 
+        if num_workers is None:
             num_workers = self.num_workers
 
-        self.AutoEncoder.eval()
+        self.encoder.eval()
         self.predictor.eval()
 
         with torch.no_grad():
@@ -695,38 +774,40 @@ class GTM:
             final_predictions = []
             for data in data_loader:
                 for key, value in data.items():
-                    data[key] = value.to(self.device)
-                bows = data.get("M_bow", None)
-                bows = bows.reshape(bows.shape[0], -1)
-                embeddings = data.get("M_embeddings", None)
+                    if isinstance(value, torch.Tensor):
+                        data[key] = value.to(self.device)
+
                 prevalence_covariates = data.get("M_prevalence_covariates", None)
-                content_covariates = data.get("M_content_covariates", None)
                 prediction_covariates = data.get("M_prediction", None)
-                if self.encoder_input == "bow":
-                    x_input = bows
-                elif self.encoder_input == "embeddings":
-                    x_input = embeddings
-                if self.encoder_include_prevalence_covariates:
-                    _, thetas, z = self.AutoEncoder(
-                        x_input,
-                        prevalence_covariates,
-                        content_covariates,
-                    )
+
+                # Prepare encoder input
+                modality_inputs = {}
+                for key in self.encoder_input:
+                    mod, view = parse_modality_view(key)
+                    x = data["modalities"][mod][view].to(self.device)
+                    if prevalence_covariates is not None:
+                        x = torch.cat([x, prevalence_covariates], dim=1)
+                    modality_inputs[key] = x
+
+                if self.ae_type == "vae":
+                    thetas = []
+                    for _ in range(num_samples):
+                        theta_q, z, _ = self.encoder(modality_inputs)
+                        theta_q = theta_q if to_simplex else z
+                        thetas.append(theta_q)
+                    features = torch.stack(thetas, dim=1).mean(dim=1)
                 else:
-                    prevalence_covariates_bis = None
-                    _, thetas, z = self.AutoEncoder(
-                        x_input,
-                        prevalence_covariates_bis,
-                        content_covariates,
-                    )
-                predictions = self.predictor(thetas, prediction_covariates)
+                    theta_q, z, _ = self.encoder(modality_inputs)
+                    features = theta_q if to_simplex else z
+
+                predictions = self.predictor(features, prediction_covariates)
                 if self.predictor_type == "classifier":
                     predictions = torch.softmax(predictions, dim=1)
+
                 final_predictions.append(predictions)
+
             if to_numpy:
-                final_predictions = [
-                    tensor.cpu().numpy() for tensor in final_predictions
-                ]
+                final_predictions = [p.cpu().numpy() for p in final_predictions]
                 final_predictions = np.concatenate(final_predictions, axis=0)
             else:
                 final_predictions = torch.cat(final_predictions, dim=0)
@@ -738,27 +819,35 @@ class GTM:
         Get the top words per topic, potentially influenced by content covariates.
 
         Args:
-            l_content_covariates: list with the names of the content covariates to influence the topic-word distribution.
+            l_content_covariates: list of content covariate names to influence the topic-word distribution.
             topK: number of top words to return per topic.
         """
-        self.AutoEncoder.eval()
+        for key in self.decoder_input:
+            if key.endswith("bow"):
+                decoder = self.decoders[key]
+                id2token = self.id2token.get(key, {})
+                break
+        else:
+            raise ValueError("No BOW decoder found — topic-words not available.")
+
+        decoder.eval()
         with torch.no_grad():
             topic_words = {}
-            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(
-                self.device
-            )
+            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(self.device)
+
             for k in l_content_covariates:
                 idx = [i for i, l in enumerate(self.content_colnames) if l == k][0]
                 idxes[:, (self.n_topics + idx)] += 1
-            word_dist = self.AutoEncoder.decode(idxes)
+
+            word_dist = decoder(idxes)
             word_dist = F.softmax(word_dist, dim=1)
             _, indices = torch.topk(word_dist, topK, dim=1)
             indices = indices.cpu().tolist()
-            for topic_id in range(self.n_topics):
-                topic_words["Topic_{}".format(topic_id)] = [
-                    self.id2token[idx] for idx in indices[topic_id]
-                ]
 
+            for topic_id in range(self.n_topics):
+                topic_words[f"Topic_{topic_id}"] = [
+                    id2token.get(idx, f"<UNK_{idx}>") for idx in indices[topic_id]
+                ]
         return topic_words
 
     def get_covariate_words(self, topK=8):
@@ -768,23 +857,25 @@ class GTM:
         Args:
             topK: number of top words to return per content covariate.
         """
+        for key in self.decoder_input:
+            if key.endswith("bow"):  
+                decoder = self.decoders[key]
+                id2token = self.id2token.get(key, {})
+                break
+        else:
+            raise ValueError("No BOW decoder found — covariate-words not available.")
 
-        self.AutoEncoder.eval()
+        decoder.eval()
         with torch.no_grad():
             covariate_words = {}
-            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(
-                self.device
-            )
-            word_dist = self.AutoEncoder.decode(idxes)
+            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(self.device)
+            word_dist = decoder(idxes)
             word_dist = F.softmax(word_dist, dim=1)
-            vals, indices = torch.topk(word_dist, topK, dim=1)
-            vals = vals.cpu().tolist()
+            _, indices = torch.topk(word_dist, topK, dim=1)
             indices = indices.cpu().tolist()
-            for i in range(self.n_topics + self.content_covariate_size):
-                if i >= self.n_topics:
-                    covariate_words[
-                        "{}".format(self.content_colnames[i - self.n_topics])
-                    ] = [self.id2token[idx] for idx in indices[i]]
+            for i in range(self.n_topics, self.n_topics + self.content_covariate_size):
+                cov_name = self.content_colnames[i - self.n_topics]
+                covariate_words[cov_name] = [id2token.get(idx, f"<UNK_{idx}>") for idx in indices[i]]
         return covariate_words
 
     def get_topic_word_distribution(self, l_content_covariates=[], to_numpy=True):
@@ -795,20 +886,26 @@ class GTM:
             l_content_covariates: list with the names of the content covariates to influence the topic-word distribution.
             to_numpy: whether to return the topic-word distribution as a numpy array.
         """
-        self.AutoEncoder.eval()
-        with torch.no_grad():
-            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(
-                self.device
-            )
-            for k in l_content_covariates:
-                idx = [i for i, l in enumerate(self.content_colnames) if l == k][0]
-                idxes[:, (self.n_topics + idx)] += 1
-            topic_word_distribution = self.AutoEncoder.decode(idxes)
-            topic_word_distribution = F.softmax(topic_word_distribution, dim=1)
-        if to_numpy:
-            return topic_word_distribution.cpu().detach().numpy()[0 : self.n_topics, :]
+        for key in self.decoder_input:
+            if key.endswith("bow"):  
+                decoder = self.decoders[key]
+                break
         else:
-            return topic_word_distribution[0 : self.n_topics, :]
+            raise ValueError("No BOW decoder found — topic-word distribution not available.")
+
+        decoder.eval()
+        with torch.no_grad():
+            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(self.device)
+            for k in l_content_covariates:
+                try:
+                    idx = self.content_colnames.index(k)
+                    idxes[:, self.n_topics + idx] += 1
+                except ValueError:
+                    raise ValueError(f"Content covariate '{k}' not found in content_colnames.")
+            topic_word_distribution = decoder(idxes)
+            topic_word_distribution = F.softmax(topic_word_distribution, dim=1)
+
+        return topic_word_distribution[:self.n_topics, :].cpu().numpy() if to_numpy else topic_word_distribution[:self.n_topics, :]
 
     def get_covariate_word_distribution(self, to_numpy=True):
         """
@@ -817,19 +914,22 @@ class GTM:
         Args:
             to_numpy: whether to return the covariate-word distribution as a numpy array.
         """
-        self.AutoEncoder.eval()
-        with torch.no_grad():
-            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(
-                self.device
-            )
-            topic_word_distribution = self.AutoEncoder.decode(idxes)
-            topic_word_distribution = F.softmax(topic_word_distribution, dim=1)
-        if to_numpy:
-            return topic_word_distribution.cpu().detach().numpy()[self.n_topics :, :]
+        for key in self.decoder_input:
+            if key.endswith("bow"):  
+                decoder = self.decoders[key]
+                break
         else:
-            return topic_word_distribution[self.n_topics :, :]
+            raise ValueError("No BOW decoder found — covariate-word distributions not available.")
 
-    def get_top_docs(self, dataset, topic_id=None, return_df=False, topK=1):
+        decoder.eval()
+        with torch.no_grad():
+            idxes = torch.eye(self.n_topics + self.content_covariate_size).to(self.device)
+            word_dist = decoder(idxes)
+            word_dist = F.softmax(word_dist, dim=1)
+
+        return word_dist[self.n_topics:, :].cpu().numpy() if to_numpy else word_dist[self.n_topics:, :]
+
+    def get_top_docs(self, dataset, topic_id=None, return_df=False, topK=1, num_samples: int = 1):
         """
         Get the most representative documents per topic.
 
@@ -837,9 +937,13 @@ class GTM:
             dataset: a GTMCorpus object
             topic_id: the topic to retrieve the top documents from. If None, the top documents for all topics are returned.
             return_df: whether to return the top documents as a DataFrame.
-            topK: number of top documents to return per topic. Otherwise, the documents are printed.
+            topK: number of top documents to return per topic.
+            num_samples: number of samples to draw for VAE inference (ignored for WAE).
         """
-        doc_topic_distribution = self.get_doc_topic_distribution(dataset)
+        doc_topic_distribution = self.get_doc_topic_distribution(
+            dataset, to_simplex=True, num_samples=num_samples
+        )
+
         top_k_indices_df = pd.DataFrame(
             {
                 f"Topic_{col}": top_k_indices_column(
@@ -848,40 +952,36 @@ class GTM:
                 for col in range(doc_topic_distribution.shape[1])
             }
         )
-        if return_df is False:
+
+        if not return_df:
             if topic_id is None:
                 for topic_id in range(self.n_topics):
-                    for i in top_k_indices_df["Topic_{}".format(topic_id)]:
+                    for i in top_k_indices_df[f"Topic_{topic_id}"]:
                         print(
-                            "Topic: {} | Document index: {} | Topic share: {}".format(
-                                topic_id, i, doc_topic_distribution[i, topic_id]
-                            )
+                            f"Topic: {topic_id} | Document index: {i} | Topic share: {doc_topic_distribution[i, topic_id]:.4f}"
                         )
                         print(dataset.df["doc"].iloc[i])
                         print("\n")
             else:
-                for i in top_k_indices_df["Topic_{}".format(topic_id)]:
+                for i in top_k_indices_df[f"Topic_{topic_id}"]:
                     print(
-                        "Topic: {} | Document index: {} | Topic share: {}".format(
-                            topic_id, i, doc_topic_distribution[i, topic_id]
-                        )
+                        f"Topic: {topic_id} | Document index: {i} | Topic share: {doc_topic_distribution[i, topic_id]:.4f}"
                     )
                     print(dataset.df["doc"].iloc[i])
                     print("\n")
         else:
-            l = []
-            for topic_id in range(self.n_topics):
-                for i in top_k_indices_df["Topic_{}".format(topic_id)]:
-                    d = {}
-                    d["topic_id"] = topic_id
-                    d["doc_id"] = i
-                    d["topic_share"] = doc_topic_distribution[i, topic_id]
-                    d["doc"] = dataset.df["doc"].iloc[i]
-                    l.append(d)
-            df = pd.DataFrame.from_records(l)
+            records = []
+            for t_id in range(self.n_topics):
+                for i in top_k_indices_df[f"Topic_{t_id}"]:
+                    records.append({
+                        "topic_id": t_id,
+                        "doc_id": i,
+                        "topic_share": doc_topic_distribution[i, t_id],
+                        "doc": dataset.df["doc"].iloc[i]
+                    })
+            df = pd.DataFrame.from_records(records)
             if topic_id is not None:
-                df = df[df["topic_id"] == topic_id]
-                df = df.reset_index(drop=True)
+                df = df[df["topic_id"] == topic_id].reset_index(drop=True)
             return df
 
     def plot_topic_word_distribution(
@@ -909,13 +1009,18 @@ class GTM:
             plt_savefig_args: dictionary with the parameters for the savefig function.
         """
 
+        for key in self.decoder_input:
+            if key.endswith("bow"):
+                id2token = self.id2token.get(key, {})
+                break
+
         topic_word_distribution = self.get_topic_word_distribution(
             content_covariates, to_numpy=False
         )
         vals, indices = torch.topk(topic_word_distribution, topK, dim=1)
         vals = vals.cpu().tolist()
         indices = indices.cpu().tolist()
-        topic_words = [self.id2token[idx] for idx in indices[topic_id]]
+        topic_words = [id2token[idx] for idx in indices[topic_id]]
         values = vals[topic_id]
         d = {}
         for i, w in enumerate(topic_words):
@@ -953,6 +1058,7 @@ class GTM:
         ),
         display=True,
         output_path=None,
+        num_samples: int = 1,
     ):
         """
         Visualize the documents in the corpus based on their topic distribution.
@@ -966,7 +1072,7 @@ class GTM:
             output_path: path to save the plot.
         """
 
-        matrix = self.get_doc_topic_distribution(dataset)
+        matrix = self.get_doc_topic_distribution(dataset, to_simplex=True, num_samples=num_samples)
         most_prevalent_topics = np.argmax(matrix, axis=1)
         most_prevalent_topic_share = np.max(matrix, axis=1)
 
@@ -1126,6 +1232,7 @@ class GTM:
         ),
         display=True,
         output_path=None,
+        num_samples: int = 1
     ):
         """
         Visualize the topics in the corpus based on their topic distribution.
@@ -1139,7 +1246,7 @@ class GTM:
         """
 
         matrix = self.get_topic_word_distribution()
-        doc_topic_dist = self.get_doc_topic_distribution(dataset)
+        doc_topic_dist = self.get_doc_topic_distribution(dataset, to_simplex=True, num_samples=num_samples)
         df = pd.DataFrame(doc_topic_dist)
         marker_sizes = np.array(df.mean()) * 1000
         ModelLowDim = PCA(n_components=2, **dimension_reduction_args)
@@ -1178,104 +1285,85 @@ class GTM:
         if output_path is not None:
             fig.write_html(output_path, config=dict(editable=True))
 
-    def estimate_effect(self, dataset, to_simplex = True, n_samples=20, topic_ids=None, progress_bar=True):
+    def estimate_effect(
+        self,
+        dataset,
+        to_simplex: bool = True,
+        n_samples: int = 20,
+        topic_ids: Optional[List[int]] = None,
+        progress_bar: bool = True,
+    ) -> pd.DataFrame:
         """
         GLM estimates and associated standard errors of the doc-topic prior conditional on the prevalence covariates.
 
-        Uncertainty is computed using the method of composition.
-        Technically, this means we draw a set of topic proportions from the variational posterior, 
-        run a regression topic_proportion ~ covariates, then repeat for n_samples.  
-        Quantities of interest are the mean and the standard deviation of regression coefficients across samples.
+        Uncertainty is computed using the method of composition:
+        - Sample topic proportions from the prior or variational posterior
+        - Fit OLS: topic_proportion ~ covariates
+        - Repeat n_samples times
+        - Report mean and standard deviation of coefficients
 
-        /!\ May take quite some time to run. /!\
-
-        References:
-        - Roberts, M. E., Stewart, B. M., & Airoldi, E. M. (2016). A model of text for experimentation in the social sciences. Journal of the American Statistical Association, 111(515), 988-1003.
+        Returns:
+            pd.DataFrame with columns: ['topic', 'covariate', 'mean', 'sd']
         """
+        X = dataset.M_prevalence_covariates  # (N, C)
+        covariate_names = dataset.prevalence_colnames
 
-        X = dataset.M_prevalence_covariates
+        topic_ids = topic_ids if topic_ids is not None else list(range(self.n_topics))
+        iterator = tqdm(range(n_samples)) if progress_bar else range(n_samples)
 
-        if topic_ids is None:
-            iterator = range(self.n_topics)
-        else:
-            iterator = topic_ids
+        # Store regression coefficients per topic
+        coefs_by_topic = {k: [] for k in topic_ids}
+        model = LinearRegression(fit_intercept=False)
 
-        if progress_bar:
-            samples_iterator = tqdm(range(n_samples))
-        else:
-            samples_iterator = range(n_samples)
-
-        dict_of_params = {"Topic_{}".format(k): [] for k in range(self.n_topics)}
-        OLS_model = LinearRegression(fit_intercept=False)
-        for i in samples_iterator:
+        for _ in iterator:
+            # Sample topic proportions
             if self.doc_topic_prior == "dirichlet":
-                Y = self.prior.sample(X.shape[0], X).cpu().numpy()
-            else:
-                Y = self.prior.sample(X.shape[0], X, to_simplex).cpu().numpy()
-            for k in iterator:
-                OLS_model.fit(
-                    X[
-                        :,
-                    ],
-                    Y[:, k],
+                Y = self.prior.sample(N=X.shape[0], M_prevalence_covariates=X).cpu().numpy()
+            elif self.ae_type == "vae":
+                Y = self.get_doc_topic_distribution(
+                    dataset,
+                    to_simplex=to_simplex,
+                    to_numpy=True,
+                    num_samples=1,
                 )
-                dict_of_params["Topic_{}".format(k)].append(np.array([OLS_model.coef_]))
+            else:
+                Y = self.prior.sample(N=X.shape[0], M_prevalence_covariates=X, to_simplex=to_simplex).cpu().numpy()
 
-        records_for_df = []
-        for k in iterator:
-            d = {}
-            d["topic"] = k
-            a = np.concatenate(dict_of_params["Topic_{}".format(k)])
-            mean = np.mean(a, axis=0)
-            sd = np.std(a, axis=0)
-            for i, cov in enumerate(dataset.prevalence_colnames):
-                d = {}  
-                d["topic"] = k
-                d["covariate"] = cov
-                d["mean"] = mean[i]
-                d["sd"] = sd[i]
-                records_for_df.append(d)
+            for k in topic_ids:
+                model.fit(X, Y[:, k])
+                coefs_by_topic[k].append(model.coef_.copy())
 
-        df = pd.DataFrame.from_records(records_for_df)
+        # Aggregate results
+        records = []
+        for k in topic_ids:
+            all_coefs = np.stack(coefs_by_topic[k], axis=0)  # (n_samples, n_covariates)
+            mean = all_coefs.mean(axis=0)
+            std = all_coefs.std(axis=0)
+            for i, cov in enumerate(covariate_names):
+                records.append({
+                    "topic": k,
+                    "covariate": cov,
+                    "mean": mean[i],
+                    "sd": std[i],
+                })
 
-        return df
-
-    def get_ldavis_data_format(self, dataset):
-        """
-        Returns a data format that can be used in input to pyldavis to interpret the topics.
-        """
-        term_frequency = np.ravel(dataset.M_bow.sum(axis=0))
-        doc_lengths = np.ravel(dataset.M_bow.sum(axis=1))
-        vocab = self.id2token
-        term_topic = self.get_topic_word_distribution()
-        doc_topic_distribution = self.get_doc_topic_distribution(dataset)
-
-        data = {
-            "topic_term_dists": term_topic,
-            "doc_topic_dists": doc_topic_distribution,
-            "doc_lengths": doc_lengths,
-            "vocab": vocab,
-            "term_frequency": term_frequency,
-        }
-
-        return data
+        return pd.DataFrame(records)
 
     def save_model(self, save_name):
-        autoencoder_state_dict = self.AutoEncoder.state_dict()
-        if self.labels_size != 0:
-            predictor_state_dict = self.predictor.state_dict()
-        else:
-            predictor_state_dict = None
+        encoder_state_dict = self.encoder.state_dict()
+        decoders_state_dict = {k: d.state_dict() for k, d in self.decoders.items()}
+        predictor_state_dict = self.predictor.state_dict() if self.labels_size != 0 else None
         optimizer_state_dict = self.optimizer.state_dict()
 
         all_vars = vars(self)
 
         checkpoint = {}
         for key, value in all_vars.items():
-            if key not in ["AutoEncoder", "predictor", "optimizer"]:
+            if key not in ["encoder", "decoders", "predictor", "optimizer"]:
                 checkpoint[key] = value
 
-        checkpoint["AutoEncoder"] = autoencoder_state_dict
+        checkpoint["encoder"] = encoder_state_dict
+        checkpoint["decoders"] = decoders_state_dict
         if self.labels_size != 0:
             checkpoint["predictor"] = predictor_state_dict
         checkpoint["optimizer"] = optimizer_state_dict
@@ -1286,41 +1374,23 @@ class GTM:
         """
         Helper function to load a GTM model.
         """
-        ckpt = torch.load(ckpt)
+        ckpt = torch.load(ckpt, map_location=self.device, weights_only=False)
+
         for key, value in ckpt.items():
-            if key not in ["AutoEncoder", "predictor", "optimizer"]:
+            if key not in ["encoder", "decoders", "predictor", "optimizer"]:
                 setattr(self, key, value)
 
-        if not hasattr(self, "AutoEncoder"):
-            if self.encoder_include_prevalence_covariates:
-                encoder_dims = [self.input_size + self.prevalence_covariate_size]
-            else:
-                encoder_dims = [self.input_size]
-            encoder_dims.extend(self.encoder_hidden_layers)
-            encoder_dims.extend([self.n_topics])
+        self.encoder.load_state_dict(ckpt["encoder"])
 
-            decoder_dims = [self.n_topics + self.content_covariate_size]
-            decoder_dims.extend(self.decoder_hidden_layers)
-            decoder_dims.extend([self.bow_size])
+        for key, state_dict in ckpt["decoders"].items():
+            self.decoders[key].load_state_dict(state_dict)
 
-            self.AutoEncoder = AutoEncoderMLP(
-                encoder_dims=encoder_dims,
-                encoder_non_linear_activation=self.encoder_non_linear_activation,
-                encoder_bias=self.encoder_bias,
-                decoder_dims=decoder_dims,
-                decoder_non_linear_activation=self.decoder_non_linear_activation,
-                decoder_bias=self.decoder_bias,
-                dropout=self.dropout,
-            ).to(self.device)
-
-        self.AutoEncoder.load_state_dict(ckpt["AutoEncoder"])
-
-        if self.labels_size != 0:
+        if self.labels_size != 0 and "predictor" in ckpt:
             if not hasattr(self, "predictor"):
+                predictor_dims = [self.n_topics + self.prediction_covariate_size] + \
+                                self.predictor_hidden_layers + [self.labels_size]
                 self.predictor = Predictor(
-                    predictor_dims=[self.n_topics + self.prediction_covariate_size]
-                    + self.predictor_hidden_layers
-                    + [self.labels_size],
+                    predictor_dims=predictor_dims,
                     predictor_non_linear_activation=self.predictor_non_linear_activation,
                     predictor_bias=self.predictor_bias,
                     dropout=self.dropout,
@@ -1328,23 +1398,19 @@ class GTM:
             self.predictor.load_state_dict(ckpt["predictor"])
 
         if not hasattr(self, "optimizer"):
+            all_params = list(self.encoder.parameters()) + list(self.decoders.parameters())
             if self.labels_size != 0:
-                self.optimizer = torch.optim.Adam(
-                    list(self.AutoEncoder.parameters())
-                    + list(self.predictor.parameters()),
-                    lr=self.learning_rate,
-                )
-            else:
-                self.optimizer = torch.optim.Adam(
-                    self.AutoEncoder.parameters(), lr=self.learning_rate
-                )
+                all_params += list(self.predictor.parameters())
+            self.optimizer = torch.optim.Adam(all_params, lr=self.learning_rate)
+
         self.optimizer.load_state_dict(ckpt["optimizer"])
 
     def to(self, device):
         """
         Move the model to a different device.
         """
-        self.AutoEncoder.to(device)
+        self.encoder.to(device)
+        self.decoders.to(device)
         self.prior.to(device)
         if self.labels_size != 0:
             self.predictor.to(device)

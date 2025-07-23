@@ -13,15 +13,7 @@ import spacy
 from spacy.cli import download as spacy_download
 import torch
 from torch.distributions.dirichlet import Dirichlet
-import gensim
-from gensim.corpora.dictionary import Dictionary
-
-def vect2gensim(vectorizer, dtmatrix):
-    corpus_vect_gensim = gensim.matutils.Sparse2Corpus(dtmatrix, documents_columns=False)
-    dictionary = Dictionary.from_corpus(corpus_vect_gensim,
-        id2word=dict((id, word) for word, id in vectorizer.vocabulary_.items()))
-
-    return (corpus_vect_gensim, dictionary)
+import re 
 
 class text_processor:
     """
@@ -74,8 +66,9 @@ class text_processor:
             s = [t for t in s if t.is_punct == False]
 
         if self.remove_digits:
-            s = [t for t in s if t.is_digit == False]
-
+            #s = [t for t in s if t.is_digit == False]
+            s = [t for t in s if not re.search(r'\d', t.text)]
+        
         if self.pos_tags_to_keep is not None:
             temp = []
             for t in s:
