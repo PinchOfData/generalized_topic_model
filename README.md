@@ -128,8 +128,7 @@ kl_annealing_max_beta = 1.0
 
 Get started with example notebooks in [`notebooks/`](notebooks/).
 
-The dataset used in these notebooks can be downloaded [here]("https://www.dropbox.com/scl/fi/ojshavj5azk4jt7a4p3ap/us_congress_speeches_sample.csv?rlkey=x3x86kc9pb94kuu1c8yze5u3l&st=awtc4wr2&dl=1"
-) and should be placed in the `data` folder.
+The dataset used in these notebooks can be downloaded [here]("https://www.dropbox.com/scl/fi/ojshavj5azk4jt7a4p3ap/us_congress_speeches_sample.csv?rlkey=x3x86kc9pb94kuu1c8yze5u3l&st=awtc4wr2&dl=1") and should be placed in the `data` folder.
 
 ---
 
